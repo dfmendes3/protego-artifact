@@ -1,3 +1,26 @@
+
+# for Prof. Saeed
+
+
+The modifications to the silo server are all contained in "silochanges.patch". This gets applied in build_all.sh.
+
+The silo client is heavily based on the memcached client.
+
+
+We ran the server with<br>
+`
+LD_LIBRARY_PATH=$(dirname $(find . -name "liblz4.so"))  ./silotpcc-shenango server.config breakwater 1 8001 3221225472
+`
+
+The silo client we ran with<br>
+`
+./silo-client breakwater client.config <client/agent> <num_threads> 10.10.1.1 <slo> <num_peers> <offered_load>
+`
+
+There is also run_silo.py file that Ansh used to automate the runs.
+
+---
+
 # Protego-artifact
 
 This repository includes Protego and applications that
