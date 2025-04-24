@@ -17,33 +17,38 @@ for dir in caladan caladan/shim caladan/bindings/cc caladan/apps/storage_service
 	make -C $dir
 done
 
+pushd caladan/breakwater
+sudo ./scripts/setup_machine.sh && make clean && make -j16 && make -C bindings/cc
+popd
+
 echo "$SCRIPTPATH"
 export SHENANGODIR=$SCRIPTPATH/caladan
 
-# echo building SILO
-# pushd  silo
-# ./silo.sh
-# make
-# popd
+# to build SILO properly the SHENAGODIR variable needs to be defined
+echo building SILO
+pushd  silo
+./silo.sh
+git apply ../silochanges.patch
+make
+popd
 
-# TODO
-# echo building MEMCACHED
-# pushd memcached
-# # git checkout breakwater # this shouldn't be necessary once I point it correctly. Also isn't necessary right now when testing with no submodule
-# # INHO
-# ./version.sh
-# autoreconf -i
-# # END INHO
-# # ./autogen.sh
-# ./configure --with-shenango=$SCRIPTPATH/caladan
-# make
-# popd
+pushd silo-client
+make
+popd
 
-# pushd memcached-linux
-# ./autogen.sh
-# ./configure
-# make
-# popd
+echo building MEMCACHED
+pushd memcached
+./version.sh
+autoreconf -i
+./configure --with-shenango=../caladan
+make clean
+make
+popd
+
+pushd memcached-client
+make clean
+make
+popd
 
 echo building BOEHMGC
 pushd gc

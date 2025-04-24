@@ -12,3 +12,7 @@
 	path = caladan
 	url = https://github.com/estuhr1206/caladan-overload-control.git
 	branch = breakwater_core_park_fix
+[submodule "silo"]
+	path = silo
+	url = https://github.com/shenango/silo.git
+	branch = caladan

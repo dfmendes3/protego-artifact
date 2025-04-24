@@ -34,6 +34,7 @@ make submodules -j16
 make -j16
 
 pushd ksched
+sudo rm -rf build
 make -j16
 popd
 

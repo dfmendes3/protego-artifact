@@ -1,0 +1,367 @@
+commit 603631d257256628e09e5b2932a2bd652d01252a
+Author: dmendes6 <dmendes6@node-1.dmendes6-255057.gt-8803-dns-pg0.utah.cloudlab.us>
+Date:   Thu Apr 24 09:47:53 2025 -0600
+
+    .
+
+diff --git a/Makefile b/Makefile
+index 48a2274..f2f7466 100644
+--- a/Makefile
++++ b/Makefile
+@@ -30,10 +30,12 @@ silotpcc.o: CPPFLAGS += -I$(SILO_DIR) -I$(SILO_DIR)/third-party/lz4
+ spin-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+ silotpcc-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+ common-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+-common-shenango.o: CPPFLAGS += $(INC) $(CXXFLAGS) -I$(ROOT_PATH)/bindings/cc
++common-shenango.o: CPPFLAGS += $(INC) $(CXXFLAGS) -I$(ROOT_PATH)/bindings -I$(ROOT_PATH)/breakwater/inc
+ 
+ silotpcc-shenango: silotpcc-shenango.o common-shenango.o silotpcc.o $(SILO_OBJS)
+-	$(CXX) -o $@ $^ $(LDFLAGS) ${SHENANGODIR}/shim/libshim.a -ldl $(RUNTIME_LIBS) $(ROOT_PATH)/bindings/cc/librt++.a -L$(SILO_DIR)/third-party/lz4 -llz4 -lnuma -ldb_cxx -pthread -ljemalloc
++	$(CXX) -o $@ $^ $(LDFLAGS) ${SHENANGODIR}/shim/libshim.a -ldl $(RUNTIME_LIBS) $(ROOT_PATH)/bindings/cc/librt++.a \
++	 -L$(SILO_DIR)/third-party/lz4 -llz4 -lnuma -ldb_cxx -pthread -ljemalloc \
++	 -L$(ROOT_PATH)/breakwater -lbw
+ 
+ 
+ clean:
+diff --git a/common-shenango.cc b/common-shenango.cc
+index 7928917..601b64b 100644
+--- a/common-shenango.cc
++++ b/common-shenango.cc
+@@ -8,11 +8,18 @@ extern "C" {
+ #include <runtime/storage.h>
+ #include <runtime/preempt.h>
+ #include "common.h"
++
++#include <breakwater/breakwater.h>
++#include <breakwater/dagor.h>
++#include <breakwater/seda.h>
++#include <breakwater/nocontrol.h>
++
+ }
+ 
+-#include "net.h"
+-#include "sync.h"
+-#include "thread.h"
++#include "cc/runtime.h"
++#include "cc/net.h"
++#include "cc/sync.h"
++#include "cc/thread.h"
+ 
+ #include <iostream>
+ #include <memory>
+@@ -21,6 +28,11 @@ extern "C" {
+ uint16_t server_port;
+ __thread int thread_no;
+ 
++#define RPC_STAT_PORT 8002
++#define RPC_STAT_MAGIC 0xDEADBEEF
++const struct crpc_ops *crpc_ops;
++const struct srpc_ops *srpc_ops;
++
+ struct Payload {
+   uint64_t work_iterations;
+   uint64_t index;
+@@ -42,9 +54,14 @@ class SharedTcpStream {
+ 
+ class RequestContext {
+  public:
++  /*
+   RequestContext(std::shared_ptr<SharedTcpStream> c) : conn(c) {}
++  */
++  RequestContext() {}
+   Payload p;
++  /*
+   std::shared_ptr<SharedTcpStream> conn;
++  */
+   void *operator new(size_t size) {
+     void *p = smalloc(size);
+     if (unlikely(p == nullptr)) throw std::bad_alloc();
+@@ -53,7 +70,8 @@ class RequestContext {
+   void operator delete(void *p) { sfree(p); }
+ };
+ 
+-void HandleRequest(RequestContext *ctx) {
++void HandleRequest(RequestContext *ctx, struct srpc_ctx *bw_ctx) {
++
+   uint64_t idx = -1;
+   uint64_t before = rdtsc();
+   bool vret = process_request_new(&idx);
+@@ -66,46 +84,72 @@ void HandleRequest(RequestContext *ctx) {
+ 
+   uint64_t val = ((vret ? 1UL : 0UL) << 40) | (idx << 32) | (total_execution_us << 16);
+ 
+-  WARN_ON_ONCE(idx > 4);
++  // WARN_ON_ONCE(idx > 4);
++  // hmmm...
+ 
+   ctx->p.randomness = hton64(after);
++  memcpy(bw_ctx->resp_buf, &ctx->p, sizeof(ctx->p));
++  bw_ctx->resp_len = sizeof(ctx->p);
++
++  /*
+   ssize_t ret = ctx->conn->WriteFull(&ctx->p, sizeof(ctx->p));
+   if (ret != static_cast<ssize_t>(sizeof(ctx->p))) {
+     if (ret != -EPIPE && ret != -ECONNRESET) log_err("tcp_write failed");
+   }
++  */
+ }
+ 
+-void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
+-  auto resp = std::make_shared<SharedTcpStream>(c);
+ 
+- /* allocate context */
+-  auto ctx = new RequestContext(resp);
+-  while (true) {
+-    Payload *p = &ctx->p;
+-
+-    /* Receive a work request. */
+-    ssize_t ret = c->ReadFull(p, sizeof(*p));
+-    if (ret != static_cast<ssize_t>(sizeof(*p))) {
+-      if (ret != 0 && ret != -ECONNRESET)
+-        log_err("read failed, ret = %ld", ret);
+-      delete ctx;
+-      return;
+-    }
+-#define OUT_OF_ORDER_CONN 1
+-#ifdef OUT_OF_ORDER_CONN
+-    rt::Thread([=] {
+-      HandleRequest(ctx);
+-      delete ctx;
+-    })
+-        .Detach();
+-    ctx = new RequestContext(resp);
+-#else
+-    HandleRequest(ctx);
+-#endif
++
++static void shenango_handler(struct srpc_ctx *bw_ctx)
++{
++
++  if (unlikely(bw_ctx->req_len != sizeof(Payload))) {
++    log_err("got invalid RPC len %ld", bw_ctx->req_len);
++    return;
+   }
++  Payload *request_header = reinterpret_cast<Payload *>(bw_ctx->req_buf);
++
++  auto ctx = new RequestContext(); // make constructor from srpc_ctx instead?
++  ctx->p = *request_header;
++
++  HandleRequest(ctx, bw_ctx);
++  // no need to spawn thread b/c implicitly out of order in breakwater?
++
+ }
+ 
++static void rpc_stat_server(void *arg);
++
+ void MainHandler(void *arg) {
++
++  thread_spawn(rpc_stat_server, NULL);
++
++  srpc_ops = &sbw_ops;
++  std::string olcalg = (char *)arg;
++  if (olcalg.compare("breakwater") == 0) {
++    crpc_ops = &cbw_ops;
++    srpc_ops = &sbw_ops;
++  } else if (olcalg.compare("dagor") == 0) {
++    crpc_ops = &cdg_ops;
++    srpc_ops = &sdg_ops;
++  } else if (olcalg.compare("seda") == 0) {
++    crpc_ops = &csd_ops;
++    srpc_ops = &ssd_ops;
++  } else if (olcalg.compare("nocontrol") == 0) {
++    crpc_ops = &cnc_ops;
++    srpc_ops = &snc_ops;
++  } else {
++    std::cerr << "Invalid overload control algorithm: " << olcalg << std::endl;
++    return;
++  }
++
++  int ret = srpc_ops->srpc_enable(shenango_handler);
++  if (ret) panic("couldn't enable RPC server");
++
++  rt::WaitGroup(1).Wait();
++  // from breakwater/netbench.cc
++
++  /*
+   std::unique_ptr<rt::TcpQueue> q(rt::TcpQueue::Listen({0, server_port}, 4096));
+   if (q == nullptr) panic("couldn't listen for connections");
+ 
+@@ -116,6 +160,7 @@ void MainHandler(void *arg) {
+     if (c == nullptr) panic("couldn't accept a connection");
+     rt::Thread([=] { ServerWorker(std::shared_ptr<rt::TcpConn>(c)); }).Detach();
+   }
++  */
+ }
+ 
+ int init_thread_wrap(void) {
+@@ -123,14 +168,103 @@ int init_thread_wrap(void) {
+   init_thread();
+   return 0;
+ }
++static void rpc_stat_worker(void *arg) {
++  tcpconn_t *c = reinterpret_cast<tcpconn_t *>(arg);
++  struct {
++    uint64_t idle;
++    uint64_t busy;
++    unsigned int num_cores;
++    unsigned int max_cores;
++    uint64_t winu_rx;
++    uint64_t winu_tx;
++    uint64_t win_tx;
++    uint64_t req_rx;
++    uint64_t req_dropped;
++    uint64_t resp_tx;
++  } sstat_raw;
++
++  uint64_t magic;
++  ssize_t ret;
++  ssize_t done;
++
++  while(true) {
++
++    log_err("rpc_stat_worker - new connection");
++
++    ret = tcp_read(c, &magic, sizeof(magic));
++
++    if (ret <= 0) goto done;
++
++    if (ret != (ssize_t)sizeof(magic) || ntoh64(magic) != RPC_STAT_MAGIC) {
++      WARN();
++      goto done;
++    }
++
++    sstat_raw.idle = 0; // not supported yet
++    sstat_raw.busy = 0; // not supported yet
++    sstat_raw.num_cores = runtime_max_cores();
++    sstat_raw.max_cores = (unsigned int)sysconf(_SC_NPROCESSORS_ONLN);
++    sstat_raw.winu_rx = srpc_ops->srpc_stat_cupdate_rx(); //srpc_stat_winu_rx();
++    sstat_raw.winu_tx = srpc_ops->srpc_stat_ecredit_tx() ; //srpc_stat_winu_tx();
++    sstat_raw.win_tx = srpc_ops->srpc_stat_credit_tx(); //srpc_stat_win_tx();
++    sstat_raw.req_rx = srpc_ops->srpc_stat_req_rx();
++    sstat_raw.req_dropped = srpc_ops->srpc_stat_req_dropped();
++    sstat_raw.resp_tx = srpc_ops->srpc_stat_resp_tx();
++
++    done = 0;
++    do {
++      ret = tcp_write(c, (char *)&sstat_raw + done, sizeof(sstat_raw) - done);
++      if (ret < 0) {
++        WARN_ON(ret != -EPIPE && ret != -ECONNRESET);
++        goto done;
++      }
++      done += ret;
++    } while (done < sizeof(sstat_raw));
++  }
++  done:
++  tcp_close(c);
++  return;
++}
++
++static void rpc_stat_server(void *arg) {
++  struct netaddr laddr;
++  tcpconn_t *c;
++  tcpqueue_t *q;
++  int ret;
++
++  laddr.ip = 0;
++  laddr.port = RPC_STAT_PORT;
++
++  log_err("listening for RPC stats on port %d", RPC_STAT_PORT);
++
++  ret = tcp_listen(laddr, 4096, &q);
++
++  log_err("tcp_listen returned %d", ret);
++
++  BUG_ON(ret);
++
++  while(true) {
++
++      log_err("rpc_stat_server - waiting for connection");
++
++      ret = tcp_accept(q, &c);
++
++      log_err("tcp_accept returned %d", ret);
++
++      BUG_ON(ret);
++      ret = thread_spawn(rpc_stat_worker, c);
++      WARN_ON(ret);
++  }
++}
++
+ 
+-int init_shenango(const char *cfgpath, int port) {
++int init_shenango(const char *cfgpath, int port, char *oc_algo) {
+   int ret;
+   runtime_set_initializers(init_global, init_thread_wrap, NULL);
+ 
+   server_port = port;
+ 
+-  ret = runtime_init(cfgpath, MainHandler, NULL);
++  ret = runtime_init(cfgpath, MainHandler, oc_algo);
+   if (ret) fprintf(stderr, "failed to start runtime\n");
+ 
+   return ret;
+diff --git a/common.h b/common.h
+index ad6205e..47e8e91 100644
+--- a/common.h
++++ b/common.h
+@@ -12,7 +12,7 @@ bool process_request(void);
+ bool process_request_new(uint64_t *worker_idx);
+ void start_ix_server(int udp);
+ void start_linux_server(void);
+-int init_shenango(const char *cfgpath, int port);
++int init_shenango(const char *cfgpath, int port, char *oc_algo);
+ int init_global(void);
+ 
+ extern __thread int thread_no;
+diff --git a/remake-silo.sh b/remake-silo.sh
+new file mode 100644
+index 0000000..2d8ad0b
+--- /dev/null
++++ b/remake-silo.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++
++set -e
++
++export SHENANGODIR=$(readlink -f $PWD/..)/caladan
++echo building SILO in $SHENANGODIR
++make
+\ No newline at end of file
+diff --git a/silotpcc-shenango.c b/silotpcc-shenango.c
+index ea33014..4e1a415 100644
+--- a/silotpcc-shenango.c
++++ b/silotpcc-shenango.c
+@@ -175,7 +175,7 @@ void init_thread(void)
+ 
+ void usage(const char *p)
+ {
+-	fprintf(stderr, "usage: %s cfgfile nthreads port memory [wload_desc]\n", p);
++	fprintf(stderr, "usage: %s oc_algo cfgfile nthreads port memory [wload_desc]\n", p);
+ }
+ 
+ extern char *txn_desc;
+@@ -184,17 +184,17 @@ int main(int argc, char *argv[])
+ {
+ 	int port;
+ 
+-	if (argc < 5) {
++	if (argc < 6) {
+ 		usage(argv[0]);
+ 		return -1;
+ 	}
+ 
+-	nrcpus = atoi(argv[2]);
+-	port = atoi(argv[3]);  
+-	memory = atoll(argv[4]);
++	nrcpus = atoi(argv[3]);
++	port = atoi(argv[4]);
++	memory = atoll(argv[5]);
+ 
+-	if (argc > 5)
+-		txn_desc = argv[5];
++	if (argc > 6)
++		txn_desc = argv[6];
+ 
+-	return init_shenango(argv[1], port);
++	return init_shenango(argv[1], port, argv[2]);
+ }
